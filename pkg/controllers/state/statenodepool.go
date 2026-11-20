@@ -89,7 +89,7 @@ func (n *NodePoolState) MarkNodeClaimDeleting(npName, ncName string) {
 	n.nodePoolNameToNodeClaimState[npName].Active.Delete(ncName)
 }
 
-// Marks the given NodeClaim as Deleting in NodePoolState
+// Marks the given NodeClaim as PendingDisruption in NodePoolState
 func (n *NodePoolState) MarkNodeClaimPendingDisruption(npName, ncName string) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -98,6 +98,21 @@ func (n *NodePoolState) MarkNodeClaimPendingDisruption(npName, ncName string) {
 	n.nodePoolNameToNodeClaimState[npName].Active.Delete(ncName)
 	n.nodePoolNameToNodeClaimState[npName].Deleting.Delete(ncName)
 	n.nodePoolNameToNodeClaimState[npName].PendingDisruption.Insert(ncName)
+}
+
+// UnmarkPendingDisruption moves the NodeClaim back to Active only if it's still PendingDisruption. Anything else has
+// already moved it on (the informer to Deleting once it started deleting, or Cleanup once it's gone), and marking it
+// Active then would count a deleting or deleted NodeClaim as running.
+func (n *NodePoolState) UnmarkPendingDisruption(npName, ncName string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	st, ok := n.nodePoolNameToNodeClaimState[npName]
+	if !ok || !st.PendingDisruption.Has(ncName) {
+		return
+	}
+	st.PendingDisruption.Delete(ncName)
+	st.Active.Insert(ncName)
 }
 
 // Cleans up the NodeClaim in NodePoolState and NodePool keys if NodePool is deleted or its sized down to 0
@@ -112,7 +127,7 @@ func (n *NodePoolState) Cleanup(ncName string) {
 		npState.Active.Delete(ncName)
 		npState.PendingDisruption.Delete(ncName)
 
-		if npState.Active.Len() == 0 && npState.Deleting.Len() == 0 {
+		if npState.Active.Len() == 0 && npState.Deleting.Len() == 0 && npState.PendingDisruption.Len() == 0 {
 			delete(n.nodePoolNameToNodeClaimState, npName)
 			delete(n.nodePoolNameToNodePoolLimit, npName)
 		}
@@ -199,8 +214,25 @@ func (n *NodePoolState) UpdateNodeClaim(nodeClaim *v1.NodeClaim, markedForDeleti
 	if markedForDeletion {
 		n.MarkNodeClaimDeleting(npName, nodeClaim.Name)
 	} else {
-		n.MarkNodeClaimActive(npName, nodeClaim.Name)
+		n.markNodeClaimActiveUnlessPendingDisruption(npName, nodeClaim.Name)
 	}
+}
+
+// markNodeClaimActiveUnlessPendingDisruption marks the NodeClaim Active unless it's PendingDisruption. The disruption
+// queue marks a candidate PendingDisruption before it creates the replacement and patches the candidate's NodeClaim in
+// between, so a NodeClaim update alone must not move it back to Active. Otherwise static deprovisioning counts both the
+// candidate and its replacement as Active and deletes the replacement as surplus. The queue moves the candidate out of
+// PendingDisruption itself, to Deleting via MarkForDeletion or back to Active via UnmarkForDeletion.
+func (n *NodePoolState) markNodeClaimActiveUnlessPendingDisruption(npName, ncName string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.ensureNodePoolEntry(npName)
+
+	if n.nodePoolNameToNodeClaimState[npName].PendingDisruption.Has(ncName) {
+		return
+	}
+	n.nodePoolNameToNodeClaimState[npName].Deleting.Delete(ncName)
+	n.nodePoolNameToNodeClaimState[npName].Active.Insert(ncName)
 }
 
 func (n *NodePoolState) ensureNodePoolEntry(np string) {
