@@ -2754,6 +2754,56 @@ var _ = Describe("NodePoolState Tracking", func() {
 				Expect(deleting).To(Equal(0))
 				Expect(pendingdisruption).To(Equal(2))
 			})
+
+			It("should keep a NodeClaim PendingDisruption when the NodeClaim is updated", func() {
+				ExpectApplied(ctx, env.Client, nodeClaim)
+				ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
+				cluster.NodePoolState.MarkNodeClaimPendingDisruption(nodePool.Name, nodeClaim.Name)
+
+				// The disruption queue sets the DisruptionReason condition after marking the candidate PendingDisruption
+				nodeClaim.StatusConditions().SetTrueWithReason(v1.ConditionTypeDisruptionReason, string(v1.DisruptionReasonDrifted), string(v1.DisruptionReasonDrifted))
+				ExpectApplied(ctx, env.Client, nodeClaim)
+				ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
+
+				running, deleting, pendingdisruption := cluster.NodePoolState.GetNodeCount(nodePool.Name)
+				Expect(running).To(Equal(0))
+				Expect(deleting).To(Equal(0))
+				Expect(pendingdisruption).To(Equal(1))
+
+				// Only an explicit unmark moves it back to Active
+				cluster.UnmarkForDeletion(nodeClaim.Status.ProviderID)
+				running, deleting, pendingdisruption = cluster.NodePoolState.GetNodeCount(nodePool.Name)
+				Expect(running).To(Equal(1))
+				Expect(deleting).To(Equal(0))
+				Expect(pendingdisruption).To(Equal(0))
+			})
+
+			It("should move a PendingDisruption NodeClaim to Deleting once it starts deleting", func() {
+				nodeClaim.Finalizers = []string{v1.TerminationFinalizer}
+				ExpectApplied(ctx, env.Client, nodeClaim)
+				ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
+				cluster.NodePoolState.MarkNodeClaimPendingDisruption(nodePool.Name, nodeClaim.Name)
+
+				ExpectDeletionTimestampSet(ctx, env.Client, nodeClaim)
+				ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
+				ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 1, 0)
+
+				// A command that fails to start must not count the deleting NodeClaim as running again
+				cluster.NodePoolState.UnmarkPendingDisruption(nodePool.Name, nodeClaim.Name)
+				ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 1, 0)
+			})
+
+			It("should not track a cleaned up NodeClaim again when unmarking PendingDisruption", func() {
+				cluster.NodePoolState.MarkNodeClaimPendingDisruption(nodePool.Name, nodeClaim.Name)
+				ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 0, 1)
+
+				ExpectDeleted(ctx, env.Client, nodeClaim)
+				ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
+				ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 0, 0)
+
+				cluster.NodePoolState.UnmarkPendingDisruption(nodePool.Name, nodeClaim.Name)
+				ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 0, 0)
+			})
 		})
 
 		Context("DeleteNodeClaim", func() {
@@ -2779,6 +2829,19 @@ var _ = Describe("NodePoolState Tracking", func() {
 				Expect(cluster.NodeClaimExists(nodeClaim.Name)).To(BeFalse())
 			})
 
+			It("should keep a PendingDisruption NodeClaim when the NodePool's last Active NodeClaim is removed", func() {
+				// A one-replica static NodePool mid-drift: the candidate is PendingDisruption and its replacement is the
+				// only Active NodeClaim. The replacement failing to launch must not drop the candidate from the count.
+				cluster.NodePoolState.MarkNodeClaimPendingDisruption(nodePool.Name, nodeClaim.Name)
+				replacement := test.NodeClaim(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name}}})
+				ExpectApplied(ctx, env.Client, replacement)
+				ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(replacement))
+				ExpectStateNodePoolCount(cluster, nodePool.Name, 1, 0, 1)
+
+				ExpectDeleted(ctx, env.Client, replacement)
+				ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(replacement))
+				ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 0, 1)
+			})
 		})
 
 		Context("MarkForDeletion", func() {
